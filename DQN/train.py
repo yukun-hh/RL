@@ -23,34 +23,31 @@ E_GREED_START = 0.1
 E_GREED_MIN   = 0.01
 E_GREED_DECAY = 0.995
 
+# ---------------- 目标网络：软更新 ----------------
+# 不再“每 N 步把在线网络的参数整个拷过去”，而是每做一次梯度下降，
+# 就让目标网络的参数朝在线网络挪一小步：θ_target ← (1-τ)·θ_target + τ·θ_online
+# τ 越大跟得越紧。0.005 意味着目标网络大致是最近 200 次更新的滑动平均。
+TAU = 0.005
+
 # ---------------- 暖启动 ----------------
-# 阶段一：前 WARMUP_ENV_STEPS 步用纯随机动作把回放池填起来，这期间不做任何梯度下降。
-#         目的是让池子里有足够多样的数据，而不是一开始就拿最近十几步高度相关的样本去学。
+# 前 WARMUP_ENV_STEPS 步用纯随机动作把回放池填起来，这期间不做任何梯度下降。
+# 目的是让池子里有足够多样的数据，而不是一开始就拿最近十几步高度相关的样本去学。
+# 注意：软更新下目标网络每步都在动，不会出现“停在随机初始化上”的问题，
+#      所以以前那套“热身期高频同步”的机制已经不需要了。
 WARMUP_ENV_STEPS = 2000
-
-# 阶段二：正式开始训练后的前 WARMUP_LEARN_STEPS 次梯度下降算“热身期”。
-#         这段时间目标网络跟得紧（每 WARMUP_SYNC_FREQ 步同步一次）。
-#         否则目标网络会一直停在随机初始化上，前期训练等于拿噪声当标签。
-WARMUP_LEARN_STEPS = 2000
-WARMUP_SYNC_FREQ = 100
-
-# 阶段三：热身结束后，目标网络改为每 TARGET_UPDATE_FREQ 次梯度下降同步一次，
-#         同步慢一点换取训练稳定。
-TARGET_UPDATE_FREQ = 2000
 
 # 模型存到脚本所在目录，避免从别的目录运行时跑到别处去
 MODEL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cartpole_dqn.pt")
 
 def in_warmup(agent):
-    # 两个热身阶段任意一个没走完，都还算暖启动中
-    return (agent.env_step <= WARMUP_ENV_STEPS) or (agent.learn_step <= WARMUP_LEARN_STEPS)
+    return agent.env_step <= WARMUP_ENV_STEPS
 
-def need_sync_target(learn_step):
-    # 热身期：跟得紧，让目标网络尽快摆脱随机初始化
-    if learn_step <= WARMUP_LEARN_STEPS:
-        return learn_step % WARMUP_SYNC_FREQ == 0
-    # 正式期：慢一点，换稳定
-    return learn_step % TARGET_UPDATE_FREQ == 0
+def soft_update(model, model_fix, tau=TAU):
+    # θ_target ← (1-τ)·θ_target + τ·θ_online
+    # 用 in-place 计算，不产生新的计算图；目标网络本来就不需要梯度
+    with torch.no_grad():
+        for target_param, param in zip(model_fix.parameters(), model.parameters()):
+            target_param.data.mul_(1.0 - tau).add_(param.data, alpha=tau)
 
 def try_episode(env,agent,model_fix,model,buffer):
     total_reward = 0
@@ -59,8 +56,8 @@ def try_episode(env,agent,model_fix,model,buffer):
     while True:
         step+=1
         agent.env_step += 1
-        # 暖启动阶段一：动作全随机，只往池子里存，不训练
-        if agent.env_step <= WARMUP_ENV_STEPS:
+        # 暖启动阶段：动作全随机，只往池子里存，不训练
+        if in_warmup(agent):
             action = numpy.random.randint(agent.act_n)
         else:
             action = agent.sample(obs,model)
@@ -68,12 +65,10 @@ def try_episode(env,agent,model_fix,model,buffer):
         done = terminated or truncated
         buffer.push((obs,action,reward,next_obs,done))
 
-        if (len(buffer) > MEMORY_WARMUP_SIZE) and (agent.env_step > WARMUP_ENV_STEPS) and (step % FREQ == 0):
+        if (len(buffer) > MEMORY_WARMUP_SIZE) and (not in_warmup(agent)) and (step % FREQ == 0):
             batch = buffer.sample_transposed(BATCH_SIZE)
             loss = agent.train(batch,model,model_fix)
-            # 按“梯度下降次数”决定是否同步目标网络
-            if need_sync_target(agent.learn_step):
-                model_fix.load_state_dict(model.state_dict())
+            soft_update(model,model_fix)     # 每次梯度下降后，目标网络挪一小步
         total_reward += reward
         obs =next_obs
         if done:
@@ -128,15 +123,15 @@ def main():
     model,model_fix = DQN_model(),DQN_model()
     model.to(DEVICE)                            # 主网络放到设备上
     model_fix.to(DEVICE)                        # 目标网络也要放到同一个设备上
-    print("使用设备: %s" % DEVICE)
+    print("使用设备: %s | 目标网络软更新 tau=%.4f" % (DEVICE,TAU))
 
-    agent = Agent(obs_shape,action_dim,model,
+    agent = Agent(obs_shape,action_dim,model,gamma=0.995,
                   e_greed=E_GREED_START,
                   e_greed_min=E_GREED_MIN,
                   e_greed_decay=E_GREED_DECAY)
     episode=0
     best_score = load_best_score()               # 历史最好成绩，没有模型文件时是 -1
-    model_fix.load_state_dict(model.state_dict())    # 开训前先对齐一次
+    model_fix.load_state_dict(model.state_dict())    # 开训前先对齐一次，之后全靠软更新
     warmup_reported = False
     while episode < MAX_EPISODE:
         total_reward = try_episode(env,agent,model_fix,model,buffer)
@@ -144,8 +139,8 @@ def main():
         if not in_warmup(agent):
             if not warmup_reported:
                 warmup_reported = True
-                print(">>> 暖启动结束：已交互 %d 步、梯度下降 %d 次，目标网络切换为每 %d 步同步"
-                      % (agent.env_step,agent.learn_step,TARGET_UPDATE_FREQ))
+                print(">>> 暖启动结束：已交互 %d 步，开始训练（目标网络 tau=%.4f 软更新）"
+                      % (agent.env_step,TAU))
             agent.decay_e_greed()                # 暖启动期间动作是随机的，衰减探索率没意义
             if episode % EVAL_EVERY == 0:
                 print("episode %d | train reward %.0f | e_greed %.3f | 梯度步数 %d | 环境步数 %d"
